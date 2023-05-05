@@ -1,0 +1,962 @@
+#include <MyVarSpeedServo.h>
+
+//Two sensors at ends of a block are checked to define a block and train direction
+//Crossing signal and gate can be triggered for each block; speed can be calculated for one block
+
+/* Code provided "AS IS" with no warranties! PLEASE DO NOT DISTRIBUTE FURTHER WITHOUT PERMISSION OF AUTHOR
+   Distributed subject to license as specified in the Github reposoitory
+   Code on Github may be modified or withdrawn at any time
+
+   Copyright (c) 2019, 2020, 2021, 2022, 2023 Jerry Grochow
+*/
+
+
+//***SET UP FOR MULTIPLE BLOCKS WITH CROSSING SIGNAL***
+//***NOTE: May need to unplug RX/TX connections to RS-485 adapter board to do upload of new sketch***
+
+const bool NOJMRI = false;
+const bool DISPLAY_PRESENT = true;
+const bool DEBUG = false;
+const bool DEBUGT = true;   //Debug timing and delays  {FUTURE}
+
+//JMRI Sensors are set to indicate block occupancy, sensor detection, and direction
+//Code provided "AS IS" with no warranties! PLEASE DO NOT DISTRIBUTE FURTHER WITHOUT PERMISSION OF AUTHOR
+//Code on Github may be modified or withdraw at any time
+//Copyright (c) 2021, 2020, 2019 Jerrold M. Grochow
+
+//Based on CMRI485Sens_Sig_v8 2020-01-07
+//v1a Bug fixes  2020-01-24
+//Forked to RRXingSpeed 2020-01-31
+//v1
+//v2  Correct bugs in BlockSpeedMeasure, change bits used for speed, block reset, activation 2020-03-14
+//v3  Longer wait for retesting sensors for false signal; shorter wait for sampling sensors again 2002-04-21
+//v4  Add data for second block (animation at train station) 2020-06-16
+//v4a Try to tighten up code to reduce timeouts at JMRI      2020-07-18
+//v4b Change time increments to get more even delays         2021-06-02
+//v5  Change pin numbers, prepare for use of displays        2021-07-06
+//v6  From v7-demo:                                          2021-07-08
+//     Add SSD1305 OLED display 2021-06-07
+//     Change reading for sensor transition to inactive to avoid false changes 2021-06-15
+//     Put OLED display in subroutine 2021-06-18
+//     Improve logic for analog sensor  2021=06=20
+//    Additional changes:                                    2021-07-09
+//     Fix speed reset byte number
+//     Add heartbeat bit
+//     Raise crossing gate on block reset
+//     Use bit 48 to indicate speed change (coordinate with Jython script)
+//v6a Change block 2 settings, add light type 5              2021-07-10
+//    Add blockIdleTime computation                          2021-07-10
+//v7  Change crossing signal time computation back           2021-07-11
+//v8  Signal lights as subr                                  2021-09-10
+//v8A change servo attach-detach logic                       2021-09-24
+
+//JMRI: set up C/MRI node as SMINI to handle up to 3 blocks; set up as SUSIC to handle more blocks (limited by size of arrays in arduino code)
+//JMRI: set up following Sensors and Lights to manage three blocks:
+// [Note: Block Sensors should be defined as Entry and Exit as would be seen if train moving clockwise]
+// [Note: JMRI starts numbering C/MRI bits with 1, so C/MRI bit 0 in Arduino code is bit 1 in JMRI table]
+// [Note: Code assumes bits increments by 8 for each subsequent block. Arrays are set up to allow for five blocks.
+//   Block occupancy*         (CMRI input bit 0,  8, 16, 24, 32)(JMRI sensor 1,  9, 17, 25, 33)
+//   Entry sensor state**     (CMRI input bit 1,  9, 17, 25, 33)(JMRI sensor 2, 10, 18, 26, 34)
+//   Exit sensor state**      (CMRI input bit 2, 10, 18, 26, 34)(JMRI sensor 3, 11, 19, 27, 35)
+//   Exit-entry (CCW) travel* (CMRI input bit 3, 11, 19, 27, 35)(JMRI sensor 4, 12, 20, 28, 36)
+//   Entry-exit (CW) travel*  (CMRI input bit 4, 12, 20, 28, 36)(JMRI sensor 5, 13, 21, 29, 37)
+//   Sound on/off crossing    (CMRI input bit 5, 13, 21, 29, 37)(JMRI sensor 6, 14, 22, 30, 38)
+//   Speed***                 (CMRI input bits 40-46)           (JMRI sensor 41-47)
+//   Speed change bit***      (CMRI input bits 47)              (JMRI sensor 48)
+//   Block reset by JMRI Light(CMRI output bit 0, 1, 2, 3, 4)   (JMRI light 1, 2, 3, 4, 5)
+// *  = determined by arduino code
+//**  = sensor states are from the physical sensors
+//*** = determined by arduino code across a single block; requires JMRI script to display 8 bits as one number
+
+//C/MRI output bit JMRI_ACTIVE_BIT from JMRI tells arduino to go active
+//   Setup a JMRI Light associated with CMRI output address JMRI_ACTIVE_BIT
+//C/MRI input bit JMRI_ACTIVE_BIT from arduino tells JMRI it is active
+//   Setup a JMRI Sensor associated with CMRI input address JMRI_ACTIVE_BIT
+//C/MRI input bit JMRI_HB_BIT from arduino tells JMRI it is still alive
+//   Setup a JMRI Sensor associated with CMRI input address JMRI_HB_BIT
+
+//Arduino code maintains a single crossing signal (alternating lights) for each block, not currently linked to JMRI
+
+
+#include <CMRIFast.h>            //Simulate CMRI node
+#include <Auto485.h>             //Provide for RS485 communication
+#include <MyVarSpeedServo.h>     //Allow servo motor control of crossing gates (added: isMoving)
+#include <SPI.h>                 //Following for SSD1306 display
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+
+//Constants:
+const bool  sensorActive   = true;
+const bool  sensorInactive = false;
+const float SMPHfactor     = 56.8182 * 87; // 1000* 1/12 * 1/5280 * 3600 * [HO Scale]: Convert inches/msec to scale miles/hour
+
+const unsigned long int sensorWait    =  1000;    //Wait between sensor reads
+const unsigned long int idleWait      = 10000;    //FUTURE USE
+const unsigned long int shortWait     =    10;    //After sensor reads
+const unsigned long int crossingWait  =   400;    //Time for blink of crossing signal
+const int               analogTrigger =   325;    //Analog sensor trigger value
+
+//========================== PHYSICAL CONFIGURATION  (THIS IS FOR MY DEMO TRACK)  ==================
+/* My arduino pin configuration:
+   03(PWM)- LED 1               14(A0)- Photoresister module
+   04-      LED 1               15(A1)-Analog IR Recv (Break beam)
+   05(PWM)- LEd 2               16(A2)-IR Detector Module (Break beam)
+   06(PWM)- LED 2               17(A3)-IR Detector Module
+   07-      LED 3               18(A4)(SCA)-Display
+   08-      LED 3               19(A5)(SCL)-Display
+   09(PWM)-                        A6-
+   10(PWM)-                        A7-
+   11(PWM)- Servo
+   12-
+   13-Internal light
+*/
+
+const int CMRI_ADDR       = 5;         //CMRI NODE #5
+const int JMRI_ACTIVE_BIT = 7;        //Communicate that board and JMRI active on this CMRI bit i/o
+const int JMRI_HB_BIT     = 15;        //Heartbit bit for JMRI
+const int DE_PIN          = 2;         //Arduino pin 2 for RS485 communication
+
+const int SCREEN_WIDTH    = 128;       // OLED display width, in pixcoels
+const int SCREEN_HEIGHT   = 32;        // OLED display height, in pixels
+const int OLED_RESET      = -1;        // Reset pin # (or -1 if sharing Arduino reset pin)
+const int SCREEN_ADDRESS  = 0x3C;      //0x3D for 128x64, 0x3C for 128x32
+
+uint8_t   servoSpeed   =  16;                     //For VarSpeedServo
+int       gateDown[]   = { 0,  0,  0, 0, 0};      //Servo settings on my layout
+int       gateUp[]     = {90, 90, 90, 0, 0};
+const int numBlocks    =  3;                      //MAX = 3 for SMINI; 5 based on size of arrays in code (requires emulating larger CMRI board)
+
+//  Definitions for following variables:
+//   sensorPin = arduino pin number for each sensor [Nano pins A1-A5 can be used as digital or analog pins;  A6-A7 are exclusively analog
+//   sensorAnalog = true if analog sensor, false if digital sensor output
+//   sensorLowActive = 1 if sensor active when LOW; 0= sensor active when HIGH
+//    Digital IR Detector Module: for break-beam, set sensorLowActive to 0;  for reflector, set to 1
+//    Analog IR Detector Module: for break-beam, set to 1; for reflector, set to 0
+//    Analog IR Trans/Recvr: for break-beam, set to 1; for reflector, set to 0 (reverse if receiver output voltage reversed)
+//    Digital Photoresistor Module: set to 0 (beam-break)
+
+//***FOR DEMO: Block 0 closest to nano on left
+int  sensorPin []      = {   A1,    A0,    A0,    A2,    A2,    A3,     0,     0,     0,     0};
+bool sensorAnalog []   = { true, false, false, false, false, false, false, false, false, false};
+int  sensorLowActive[] = {    1,     0,     0,     0,     0,     1,    -1,    -1,    -1,    -1};
+//Note: For contiguous blocks, Exit sensor of Block n can also Entry sensor of Block n+1 but must be entered twice
+//Note: Program allows all sensors to be different and blocks to be non-continguous.
+//  [A1, true,1]: Analog IR trans/recvr - Beam-break
+//  [- , true,0]; Analog IR/Beam-Break transmitter/reverse-wired receiver
+//  [A2,false,0]: Digital IR Detector Module - Beam-break mode
+//  [A3,false,1]: Digital IR Detector Module - Reflector mode
+//  [A0,false,0]: Digital Photoresistor Module
+//Light type: 1= red:green; 2= alt light; 3= alt lights+gate; 4=red:green+gate; 5= gate only; 6= r/g CW; 7= r/g CCW
+int   lightType[]        = { 7, 3, 6, 0, 0};
+int   lightPin[]         = { 7, 8, 3, 4, 6, 5, 0, 0, 0, 0};
+int   lightLowActive[]   = { 1, 1, 1, 1, 1, 1, 0, 0, 0, 0};   //1=LOW to turn on; 0=HIGH to turn on
+int   gatePin[]          = { 0, 11, 0, 0, 0};                //Servo requires PWM pin
+int   gatePotPin[]       = { 0, 0, 0, 0, 0};                  //If gate also has manual operation
+//***  Crossing signals and gate trackside are not linked to JMRI)
+bool  speedEligible[]    = {   0,   1,   0,   0,   0};        //Block eligible to compute speed
+float blockLength[]      = { -1.0, 8.0, -1.0, -1.0, -1.0};  //Need block length to compute speed
+//================= END of PHYSICAL CONFIGURATION ===========================================
+
+//*************** State and output variables
+bool  prevSensorState[]  = {sensorInactive, sensorInactive, sensorInactive, sensorInactive, sensorInactive, sensorInactive, sensorInactive, sensorInactive, sensorInactive, sensorInactive}; //Initialize state of each sensor
+bool  curSensorState[]   = {sensorInactive, sensorInactive, sensorInactive, sensorInactive, sensorInactive, sensorInactive, sensorInactive, sensorInactive, sensorInactive, sensorInactive};
+int   comboSensorState[] = { -1, -1, -1, -1, -1};             //Number representing combined current and previous states at a point in time
+bool  prevBlockOcc[]     = {false, false, false, false, false};
+bool  curBlockOcc[]         = {false, false, false, false, false};
+int   curGateVal[]       = { -1, -1, -1, -1, -1};
+float trainSpeed[]       = { -1.0, -1.0, -1.0, -1.0, -1.0};
+
+enum direction {CW, CCW, INDET, UNK};                      //ClockWise, CounterClockWise, INDETerminate, UNKnown
+direction curBlockDir []    = {UNK, UNK, UNK, UNK, UNK};   //Train direction determined in each block
+direction prevBlockDir []   = {UNK, UNK, UNK, UNK, UNK};   //Previuosly determined train direction in each block
+enum measStatus {EMPTY, CLKWISE, CNTRCLKWISE, COMP, CC, ERR}; //EMPTY block, measuring in CW/CCW direction, COMPleted measurement, Can't Compute
+measStatus speedMeasStatus[] = {EMPTY, EMPTY, EMPTY, EMPTY, EMPTY};
+
+//************* Internal control variables
+bool sensorChange []        = {false, false, false, false, false, false, false, false, false, false};
+bool sensorInactiveChange[] = {false, false, false, false, false, false, false, false, false, false};   //FUTURE USE
+bool blockSensorChange[]    = {false, false, false, false, false};
+bool anySensorChange        = false;
+int  crossingSignalAlt[]    = { -1, -1, -1, -1, -1};       //Switch to alternate crossing signals
+
+//************ Time variables
+unsigned long int sensorReadTime[]     = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};   //Time that sensor was last read (FUTURE USE)
+unsigned long int startSpeedTime[]     = {0, 0, 0, 0, 0};  //Start time for speed measurement
+unsigned long int sensorDelayTime[]    = {0, 0, 0, 0, 0};  //Time to read sensor next for each block
+unsigned long int crossingSignalTime[] = {0, 0, 0, 0, 0};  //Time to alternate crossing signal
+unsigned long int crossingGateTime[]   = {0, 0, 0, 0, 0};  //Time for crossing to stay down (minimum)
+unsigned long int blockIdleStartTime[] = {0, 0, 0, 0, 0};  //When did block last change
+unsigned long int blockIdleTime[]      = {0, 0, 0, 0, 0};  //How long since block last changed state
+
+//************ Other variables
+int numSS = numBlocks * 2;             //Number of sensors (duplicates still counted)
+bool JMRIPanelAvail = false;
+unsigned long int curTime = 0;
+bool powerUp = true;                   //Need to knowfirst time sensors are activated for certain state change determination
+
+int loopCount = 0;                     //DEBUG
+
+//*********************** DISPLAY *******************************************
+// train cars-128x32BW
+static const unsigned char PROGMEM trainCars [] = {
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xFC, 0x00, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1F, 0xFF, 0xC0, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F, 0xFF, 0xF8, 0x00, 0x00,
+  0x03, 0xFF, 0xFF, 0xFF, 0xFC, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F, 0xFF, 0xFE, 0x00, 0x00,
+  0x00, 0xFF, 0xFF, 0xFF, 0xF0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3F, 0xFF, 0xFF, 0x07, 0xF8,
+  0x00, 0xFF, 0xFF, 0xFF, 0xF0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3C, 0x00, 0xFF, 0xC7, 0xF8,
+  0x00, 0xE0, 0x06, 0x00, 0x70, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x38, 0x00, 0x39, 0xC3, 0xE0,
+  0x00, 0xE0, 0x06, 0x00, 0x70, 0x00, 0x00, 0x61, 0xF8, 0x00, 0x00, 0x38, 0x00, 0x78, 0x03, 0xE0,
+  0x00, 0xE0, 0x06, 0x00, 0x70, 0x00, 0x01, 0xFF, 0xFE, 0x00, 0x00, 0x38, 0x00, 0x78, 0x03, 0xE0,
+  0x00, 0xE0, 0x06, 0x00, 0x70, 0x00, 0x03, 0xFF, 0xFF, 0xF0, 0x00, 0x38, 0x00, 0x78, 0x03, 0xC0,
+  0x00, 0xE0, 0x06, 0x00, 0x70, 0x00, 0x07, 0xFF, 0xFF, 0xF8, 0x00, 0x78, 0x00, 0x78, 0x03, 0xC0,
+  0x00, 0xE0, 0x06, 0x00, 0x70, 0x00, 0x0F, 0xFF, 0xFF, 0xFC, 0x00, 0x78, 0x00, 0x7C, 0x01, 0xC0,
+  0x00, 0xE0, 0x06, 0x00, 0x70, 0x00, 0x3F, 0xFF, 0xFF, 0xFF, 0xC0, 0x78, 0x03, 0xFF, 0xFF, 0x80,
+  0x00, 0xE0, 0x06, 0x00, 0x70, 0x00, 0x1F, 0xEF, 0xFF, 0xFF, 0x80, 0x7F, 0xFF, 0xFF, 0x01, 0xC0,
+  0x00, 0xFF, 0xFF, 0xFF, 0xF0, 0x00, 0x1F, 0xEF, 0xFF, 0xFF, 0x80, 0x7F, 0xFF, 0xFF, 0x80, 0x60,
+  0x00, 0xFF, 0xFF, 0xFF, 0xF0, 0x00, 0x1F, 0xEF, 0xFF, 0xFF, 0x80, 0x3F, 0xFF, 0xFF, 0xE0, 0x70,
+  0x00, 0xFF, 0xFF, 0xFF, 0xF0, 0x00, 0x1F, 0xEF, 0xFF, 0xFF, 0x80, 0x3F, 0xFF, 0xFF, 0xFF, 0xF0,
+  0x00, 0xFF, 0xFF, 0xFF, 0xF0, 0x00, 0x1F, 0xEF, 0xFF, 0xFF, 0x80, 0x3F, 0xFF, 0xFF, 0xFF, 0xF8,
+  0x00, 0xFF, 0xFF, 0xFF, 0xF0, 0x00, 0x1F, 0xEF, 0xFF, 0xFF, 0x80, 0x3E, 0x03, 0xFF, 0xFF, 0xF8,
+  0x00, 0xFF, 0xFF, 0xFF, 0xF0, 0x00, 0x1F, 0xEF, 0xFF, 0xFF, 0x80, 0x39, 0xFC, 0xFF, 0xFF, 0xF0,
+  0x00, 0xFF, 0xFF, 0xFF, 0xF0, 0x00, 0x1F, 0xEF, 0xFF, 0xFF, 0x80, 0x37, 0xFF, 0x7F, 0xFF, 0xF0,
+  0x00, 0xFF, 0xFF, 0xFF, 0xF0, 0x00, 0x1F, 0xEF, 0xFE, 0x9F, 0x80, 0x2F, 0xFF, 0xBF, 0xFF, 0xE0,
+  0x00, 0xFF, 0xFF, 0xBF, 0xF0, 0x00, 0x3E, 0xFF, 0xFB, 0xFF, 0xC0, 0x0F, 0xFF, 0x99, 0xFF, 0xE0,
+  0x03, 0xBF, 0xDF, 0x7F, 0x78, 0x00, 0x39, 0xFD, 0xF7, 0xFB, 0xC0, 0x1F, 0xDF, 0xF7, 0xFF, 0xC0,
+  0xFF, 0xF9, 0xFE, 0xF3, 0xBF, 0xFF, 0xFF, 0x8E, 0xEF, 0x3F, 0xFF, 0xFF, 0xDF, 0xFF, 0x3F, 0x80,
+  0x00, 0x70, 0xE0, 0xE1, 0x80, 0x00, 0x07, 0x0E, 0x0E, 0x1C, 0x00, 0x0F, 0xFF, 0x8E, 0x1F, 0xE0,
+  0x00, 0x70, 0xE0, 0xE3, 0xC0, 0x00, 0x07, 0x0E, 0x0E, 0x1C, 0x00, 0x0F, 0xFF, 0x8F, 0x9F, 0xF0,
+  0x00, 0x7F, 0xE0, 0xFF, 0x80, 0x00, 0x03, 0xFE, 0x0F, 0xF8, 0x00, 0x07, 0xFF, 0x07, 0xFD, 0xF8,
+  0x00, 0x3F, 0xC0, 0x7F, 0x00, 0x00, 0x01, 0xFC, 0x07, 0xF0, 0x00, 0x01, 0xFE, 0x03, 0xF9, 0xFC,
+  0x00, 0x06, 0x00, 0x1C, 0x00, 0x00, 0x00, 0x70, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+
+//================== Initialize objects from libraries
+MyVarSpeedServo servo0;                  //Set up one servo for each crossing gate
+Auto485 bus(DE_PIN);                   //Initiate communications object
+//CMRIFast cmri(CMRI_ADDR, 24, 48, bus);   //SMINI = 24 inputs, 48 outputs [WILL NEED MORE INPUTS TO CONTROL 5 BLOCKS]
+CMRIFast cmri(CMRI_ADDR, 48, 24, bus);     //SUSIC with 48 inputs, 24 outputs (input = sent to JMRI; output = rcvd from JMRI)
+//NOTE: Set up JMRI to simulate SUSIC rather than SMINI to allow more inputs
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+
+//========================================================================================
+void setup() {
+
+  //*****************  SKETCH NAME  *****************************************************
+  //                                                                                    *
+  bus.begin(19200, SERIAL_8N2);          //MAKE SURE JMRI CONNECTION SET TO THIS SPEED  *
+  bus.println("Setup started: CMRI485_RRXingSpeed-v8Ademo 2021-09-24 2300");             // *
+  //                                                                                    *
+  //*************************************************************************************
+
+  //Activate special arduino pins for my layout, if any
+  //For convenience on my layout, devices plugged into adjacent pins
+  //  pinMode(sensorPin [0] + 1, OUTPUT);            digitalWrite(sensorPin [0] + 1, HIGH);
+  //  pinMode(sensorPin [0] + 2, OUTPUT);            digitalWrite(sensorPin [0] + 2, LOW);
+  //  pinMode(sensorPin [1] + 1, OUTPUT);            digitalWrite(sensorPin [1] + 1, HIGH);
+  //  pinMode(sensorPin [1] + 2, OUTPUT);            digitalWrite(sensorPin [1] + 2, LOW);
+  // //sensorPin[2] = sensorPin[1]
+  //  pinMode(sensorPin [3] + 1, OUTPUT);            digitalWrite(sensorPin [3] + 1, HIGH);
+  //  pinMode(sensorPin [3] + 2, OUTPUT);            digitalWrite(sensorPin [3] + 2, LOW);
+
+  //Activate arduino pins for this sketch
+  pinMode(LED_BUILTIN, OUTPUT);
+
+  for (int i = 0; i < numSS; i++) {
+    int j = sensorPin[i];
+    if (!sensorAnalog[i]) pinMode(j, INPUT_PULLUP);  //DO NOT INITIALIZE ANALOG PINS USED FOR ANALOG ONLY
+    j = lightPin[i];
+    if (j != 0)   {
+      pinMode(j, OUTPUT);   digitalWrite(j, HIGH ^ lightLowActive[i]); //Signal lights ON to test
+      delay(750);
+      pinMode(j, OUTPUT);   digitalWrite(j, LOW  ^ lightLowActive[i]); //Signal lights OFF
+    }
+  }
+  bus.println("Lights cycled");
+
+  //Exercise crossing gate servo
+  for (int i = 0; i < numBlocks; i++)  {
+    if (gatePin[i] != 0)     {
+      bus.println ("Servo for block " + String(i) + " ");
+      pinMode(gatePin[i], OUTPUT);          //Gate must be PWM pin
+      delay(shortWait);
+      servo0.attach(gatePin[i]);            // attaches the servo to the servo object
+      delay(shortWait);
+      curGateVal[i] = servo0.read();        //Trick to get CrossingGate to lower
+      curBlockOcc[i] = true;                //Trick to get CrossingGate to lower
+      curGateVal[i] = CrossingGate(i);      //Lower gate
+      while (servo0.isMoving(curGateVal[i]))  {
+        delay(crossingWait);
+        bus.print(".");
+      }
+      prevBlockOcc[i] = true;               //Trick to get CrossingGate to raise
+      curBlockOcc[i] = false;               //Trick to get CrossingGate to raise
+      curGateVal[i] = CrossingGate(i);
+      prevBlockOcc[i] = false;
+      while (servo0.isMoving(curGateVal[i]))   {
+        delay(crossingWait);
+        bus.print(".");
+      }
+      servo0.detach();
+      bus.println("");
+    }
+  }
+  bus.println("Servos cycled");
+
+
+  // SSD1306_SWITCHCAPVCC = generate display voltage from 3.3V internally
+  if (DISPLAY_PRESENT)               {
+    if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+      bus.println("E** SSD1306 allocation failed");
+    }
+    bus.println("Ready to display");
+    display.display();
+    delay(500);
+    display.clearDisplay();
+    display.drawBitmap(0, 0, trainCars, 128, 32, 1);     //Display bit map of train
+    display.display();
+    display.startscrollright(0x00, 0x0F);
+    delay(4000);
+    display.stopscroll();
+    display.clearDisplay();
+    bus.println("Starup display complete");
+
+    display.setTextColor(SSD1306_WHITE);
+    DisplaySpeedOLED(0);             // Diplay 0
+    delay(200);
+  }
+
+  //Flash LED that board is ready
+  bus.println("Flash internal light");
+  digitalWrite(LED_BUILTIN, HIGH);
+  delay(1000);
+  digitalWrite(LED_BUILTIN, LOW);
+
+  curTime = millis();
+  for (int i = 0; i < numBlocks; i++)   {         //Set timers to current time so no delay
+    sensorDelayTime[i] = curTime - 1;             //Allows for < comparison in loop
+    blockIdleStartTime[i] = curTime - 1;
+  }
+
+  bus.println("Setup complete");
+
+}
+
+
+//=======================================================================================
+void loop() {
+
+  curTime = millis();
+
+  //================ If JMRI panel not open, then return ===========
+
+  //loopCount = loopCount + 1;              //DEBUG
+  //bus.println ("Beg: " + String(curTime) + " " + String(loopCount));
+
+  cmri.process();                            //Checks for transmission from JMRI;  if POLL, then transmits current state of CMRI input bits
+  CheckJMRI();
+  if (!JMRIPanelAvail)  {
+    //   curGateVal(0) = ManualGate(0);      //Allow manual gate operation
+    return;
+  }
+
+  //========================= Cycle thru all listed blocks =======================
+  //===== NOTE: all settings of sensor CMRI bits done in mainline;  determination of status and outputs done in subroutines ====
+
+  anySensorChange = false;                       //Reset
+
+  for (int i = 0; i < numBlocks; i++)   {
+    int ii = i * 2;                              //Set up array indices for sensor pair for this block
+    int ij = ii + 1;
+
+    //==================== Skip to BLOCK RESET if Block Reset Light set in JMRI ================================
+    if (!cmri.get_bit(i))    {
+
+      //================== Get state of sensors  and set in JMRI ================================
+
+      blockSensorChange[i] = false;
+      sensorChange[ii]     = false;
+      sensorChange[ij]     = false;
+      if (sensorDelayTime[i] < curTime) {
+
+        //Entry sensor
+        prevSensorState[ii] = curSensorState[ii];     //Save old sensor state
+        sensorChange [ii] = SensorState(ii, i);       //Call SUBROUTINE
+        //bus.print("343: ");
+        //bus.println(String(millis()) + " SensorState: #"  + String(ii) + " " + String(curSensorState[ii]) + String(sensorChange[ii]));
+        cmri.set_bit(1 + 8 * i, curSensorState[ii]);  //Tell JMRI sensor state
+
+        //Exit sensor
+        prevSensorState[ij] = curSensorState[ij];     //Save old sensor state
+        sensorChange [ij] = SensorState(ij, i);       //Call SUBROUTINE
+        //bus.print("330: " + String(millis()));
+        //bus.println(" SensorState: #"  + String(ij) + " " + String(curSensorState[ij]) + String(sensorChange[ij]));
+        cmri.set_bit(2 + 8 * i, curSensorState[ij]);  //Tell JMRI sensor state
+
+        //========================= Create combined sensor state number ======================================
+        //Create single number from current and previous sensor states to simplify comparisons in later code, regardless of whether sensor just read or not
+
+        comboSensorState[i] = (int) curSensorState[ii] * 8 + (int) curSensorState[ij] * 4 + (int) prevSensorState[ii] * 2 + (int) prevSensorState[ij];
+
+        //Example: Entry sensor Active, exit sensor Inactive, previous entry sensor Active, previous exit sensor Inactive
+        //         AIAI = 1010 binary = 10 decimal
+        // Used in subroutines to determine block occ and train direction
+
+        //======================== Get block occupancy, train direction status and set in JMRI ==============================
+        //Redetermine block occ and train dir because combo state changes every time a sensor is read (even if sensor hasn't changed)
+
+        prevBlockOcc [i] = curBlockOcc[i];               //Save current value
+        curBlockOcc [i]     = BlockOccState(i);          //Call SUBROUTINE to determine block occupancy
+        if (!curBlockOcc[i]) {
+          if (prevBlockOcc[i]) blockIdleStartTime[i] = curTime; //If previously occupied, idle starts now
+          blockIdleTime[i] = curTime - blockIdleStartTime[i];   //How long since block occupied
+        }
+        cmri.set_bit(0 + 8 * i, curBlockOcc[i]);         //Report block occupancy
+
+        prevBlockDir [i] = curBlockDir[i];            //Save current value
+        curBlockDir [i]     = BlockDir(i);            //Call SUBROUTINE to determine train direction traversing block
+        switch (curBlockDir[i]) {                        //Report direction of train travel
+          case CW:
+            cmri.set_bit(3 + 8 * i, false);              //Clockwise
+            cmri.set_bit(4 + 8 * i, true);
+            break;
+          case CCW:
+            cmri.set_bit(3 + 8 * i, true);               //Counterclockwise
+            cmri.set_bit(4 + 8 * i, false);
+            break;
+          case INDET:
+            cmri.set_bit(3 + 8 * i, true);               //Indeterminate
+            cmri.set_bit(4 + 8 * i, true);
+            break;
+          default:
+            cmri.set_bit(3 + 8 * i, false);              //Unknown
+            cmri.set_bit(4 + 8 * i, false);
+        }
+
+        if (speedEligible[i])        {                //Only for specified blocks
+          uint8_t ts = 0;
+          //This will keep displaying speed after train has left block until another train enters block
+          if (speedMeasStatus[i] == EMPTY)   {
+            speedMeasStatus[i] = BlockSpeedMeasure(i, ii, ij); //Call SUBROUTINE to determine speed within block
+            if (speedMeasStatus[i] == CLKWISE || speedMeasStatus[i] == CNTRCLKWISE)  {
+              ts = 0;
+              cmri.set_byte(5, ts);                        //Sends speed as bit string to JMRI
+              DisplaySpeedOLED(ts);                        ///...if OLED present
+            }
+          }
+          else                {
+            speedMeasStatus[i] = BlockSpeedMeasure(i, ii, ij); //Call SUBROUTINE to determine speed within block
+            if (speedMeasStatus[i] == COMP)     {          //Translate speed into bits sent to JMRI
+              ts = round(trainSpeed[i] + 0.5);
+              // bus.println ("L2:" + String(loopCount) + " " + String(curBlockDir[i]) + " " + String(startSpeedTime[i]) + " " + String(trainSpeed[i]) + " " + String(ts));
+              cmri.set_byte(5, ts + 128);                  //Sends speed change bit and bit string to JMRI
+              DisplaySpeedOLED(ts);                        ///...if OLED present
+            }
+          }
+        } //Speed measure eligible
+
+      } //End Not in sensor delay
+    } //End Not block reset
+
+    //====================== Process if BLOCK RESET sent from JMRI ============================
+    else {
+      BlockReset (i, ii, ij);
+    }
+
+    //==================== Turn on/off signal lights, crossing signal, gate ===========================
+    cmri.set_bit(5 + 8 * i, ProcessLightType(i, ii, ij));     //Also tells JMRI whether to play sound
+
+    //DEBUG
+    //    bus.println ("End: " + String(curTime) + " " + String(i) + " " + String(comboSensorState[i]) + " " + String(prevBlockOcc[i]) + String(curBlockOcc[i]) + " " + String(prevBlockDir[i]) + String(curBlockDir[i])
+    //             + " PU SC1 SC2 SCT BI: " + String(powerUp) + " " + String(sensorChange[ii]) + " " + String(sensorChange[ij]) + " " +  String(sensorDelayTime[i]) + " " + String(blockIdleStartTime[i]));
+
+    //======================== End of Each Block Processing ==================================================
+    cmri.process();                            //Add this here to make sure response time to Poll < 250ms
+
+  } //End for processing blocks
+
+  //====================End Processing After ALL Blocks ==================================================
+  //Set powerUp to false after first sensor change after first run through
+  if (anySensorChange) powerUp = false;
+  cmri.set_bit(JMRI_HB_BIT, curTime / 1000 % 2 == 0);   //Heartbeat to JMRI
+
+}
+//==================== END OF LOOP =======================================================
+
+
+//*******************************************************************************************
+//*******************  SUBROUTINES  *********************************************************
+//*******************************************************************************************
+
+//============= Get Sensor State =========================================================
+bool SensorState(int s, int k) {           //s= sensor number; k= block number
+
+  //Sets curSensorState, anySensorChange, sensorDelayTime, sensorReadTime
+
+  bool stateChange = false;
+
+  sensorReadTime[s] = curTime;
+
+  //=== If digital sensor returning 0 or 1
+  if (!sensorAnalog[s]) {
+    curSensorState[s] = digitalRead(sensorPin[s])^sensorLowActive[s];           //Get sensor state
+    delay(shortWait);
+    //   if (DEBUGD) bus.println(String(k) +  String(s) + " shortwait.  484SS");
+    if (!curSensorState[s] && prevSensorState[s])  {           //If making transition to inactive, make sure not spurious
+      delay(shortWait * 9);                     // 200m sec = 2.4 inches @ 60 smph, 1.2 @ 30 spmh, 0.4 @ 10 spmh
+      // if (DEBUGD) bus.println(String(k) +  String(s) + " shortwait * 9.  487SS");
+      //If read is still inactive, then likely a good read;  if read goes back to active, then initial read was spurious
+      curSensorState[s] = digitalRead(sensorPin[s])^sensorLowActive[s];           //Get sensor state
+    }
+  }
+  //=== Analog sensor
+  else if (sensorAnalog[s]) {
+    curSensorState[s] = AnalogSensorRead(s, sensorPin[s]);                 //SUBROUTINE includes dealing with "low active"
+    delay(shortWait);
+    // if (DEBUGD) bus.println(String(k) + String(s) + " shortwait.  496SS");
+    if (!curSensorState[s] && prevSensorState[s])  {           //If making transition to inactive, make sure not spurious
+      delay(shortWait * 9);
+      // if (DEBUGD) bus.println(String(k) + String(s) + " shortwait * 9.  499SS");
+      curSensorState[s] = AnalogSensorRead(s, sensorPin[s]);           //Get sensor state
+
+    }
+  }
+  //=== ERROR
+  else {
+    bus.println("506E: " + String(millis()) + " SS ERR: " + String(loopCount) + " curSS: " + String(curSensorState[s]) + " stChng: " + String(stateChange));
+  }
+
+  if (curSensorState[s] != prevSensorState[s]) {                   //Change in state
+    stateChange             = true;
+    anySensorChange         = true;
+    blockSensorChange[k]    = true;
+    sensorInactiveChange[s] = false;               //Reset
+    sensorDelayTime[k]      = curTime + sensorWait;
+  }
+
+  //DEBUG
+  //bus.println("505SS: " + String(millis()) + " SensorState: " + String(loopCount) + "  " + String(k) + " " + " curSensorState: " + String(curSensorState[s]) + " stateChange: " + String(stateChange));
+
+  return stateChange;
+}
+
+//**************** Analog read *********************************************
+bool    AnalogSensorRead (int as, int asp)     {             //Read analog sensor as = analog sensor, asp = pin number
+
+  int analogSensorValue;
+  bool returnValue  = sensorInactive;                 //Preset inactive value
+
+  analogSensorValue = analogRead(asp);
+  delay(shortWait / 2);
+  // if (DEBUGD) bus.println("AS: " + String(as) +  String(asp) + " shortwait/2.  509ASR");
+  analogSensorValue = (analogSensorValue + analogRead(asp)) / 2;   //Average two reads
+  //bus.println("451: Analog sensor " + String(asp) + " " + String(analogSensorValue));
+  //if lowActive, then analogSensorValue < trigger is active;  if !lowActive, then aSV>=trigger is active
+  if (analogSensorValue < analogTrigger) returnValue = sensorLowActive[as];
+  else  returnValue = !sensorLowActive[as];
+
+  return (returnValue);
+
+}
+
+//================= Check Block Occupancy Status ===========================
+bool BlockOccState(int k) {                  //k=block
+
+  //bus.println("499BOS: " + String(comboSensorState[k]) + " PrevBO: " + String(prevBlockOcc[k]) + " PrevBD: " + String(prevBlockDir[k]));
+
+  if (comboSensorState[k] > 3) {               //States > 3 means at least one sensor active
+    //digitalWrite(LED_BUILTIN, HIGH);
+    return (true);
+  }
+  else if (comboSensorState[k] == 0 and prevBlockOcc[k])   {      //Specific cases when train between sensors
+    //digitalWrite (LED_BUILTIN, HIGH);
+    return (true);
+  }
+  else if (comboSensorState[k] == 1 and prevBlockDir[k] == CCW) {
+    //digitalWrite (LED_BUILTIN, HIGH);
+    return (true);
+  }
+  else if (comboSensorState[k] == 2 and prevBlockDir[k] == CW) {
+    //digitalWrite (LED_BUILTIN, HIGH);
+    return (true);
+  }
+  else {   //comboSensorState[k] == 3, or == 1 and CW, or == 2 and CCW, or negative (error) in which cases, unoccupied
+    //digitalWrite(LED_BUILTIN, LOW);
+    return (false);
+
+  }
+}
+
+
+//================= Check Direction ========================================
+direction BlockDir(int k) {                          //k=block
+
+  //NOT YET SET UP FOR CHANGE OF DIRECTION WITHIN BLOCK
+
+  //If not at powerup, assume block empty
+  if (!powerUp)  {
+    if (comboSensorState[k] == 4)  {
+      if (prevBlockOcc[k]) {
+        return (CW);                                                //IAII going CW
+      }
+      else return (CCW);                                            //IAII entering block, going CCW
+    }
+    if (comboSensorState[k] == 8) {
+      if (prevBlockOcc[k]) {
+        return (CCW);                                                //AIII going CCW
+      }
+      else return (CW);                                              //AIII entering block, going CW
+    }
+  }
+  //If at powerup, cannot determine train direction from first sensor reading because we don't know if train
+  //sitting between two sensors in state 4 or 8
+  else {
+    if (comboSensorState[k] == 4 or comboSensorState[k] == 8 or comboSensorState[k] == 12) return (INDET);
+  }
+
+  //Fall through to here in all other cases...
+
+  //See state table at bottom of file
+  if (comboSensorState[k] == 0)  {                                   //IIII
+    if (prevBlockOcc[k])  {
+      return (prevBlockDir[k]);
+    }
+    else return (UNK);                                               //If block empty, don't have a direction
+  }
+  else if (comboSensorState[k] == 9 or comboSensorState[k] == 11 or comboSensorState[k] == 13) { //AIIA, AIAA, AAIA
+    return (CCW);
+  }
+  else if (comboSensorState[k] == 6 or comboSensorState[k] == 7 or comboSensorState[k] == 14)  { //IAAI, IAAA, AAAI
+    return (CW);
+  }
+  else if (comboSensorState[k] == 5 or comboSensorState[k] == 10 or comboSensorState[k] == 15) { //IAIA, AIAI, AAAA
+    return (prevBlockDir[k]);
+  }
+  else if (comboSensorState[k] == 2 or comboSensorState[k] == 1)  { //IIAI or IIIA
+    //Uses a trick here: current occupancy has already been determined from previous direction of travel
+    if (curBlockOcc[k]) {
+      return (prevBlockDir[k]);
+    }
+    else return (UNK);
+  }
+  else {
+    return (UNK);                                                      //Should never get: IIAA(3), AAII(12)(valid on powerup only)
+  }
+}
+
+
+//================= Speed Display ========================================================
+measStatus BlockSpeedMeasure (int k, int m, int n)  {                    //k=block, m=entry sensor, n=exit sensor
+
+  //Returns  speed measurement progress
+  // bus.println ("S0a:" + String(loopCount) + " BO: " + String(curBlockOcc[k]) + " SM: " + String(speedMeasStatus[k]) + " " + String(curSensorState[m]) + " " + String(curSensorState[n]));
+  // bus.println ("S0b:" + String(loopCount) + " BD: " + String(curBlockDir[k]) + " " + String(startSpeedTime[k]) + " " + String(trainSpeed[k]));
+
+  if (blockSensorChange[k]) {                         //Only bother with speed measure if sensor change
+    // bus.println ("S0c:" + String(loopCount) + " BD: " + String(curBlockDir[k]) + " " + String(startSpeedTime[k]) + " " + String(trainSpeed[k]));
+    if (curBlockOcc[k])                   {
+      switch (speedMeasStatus[k])      {
+        case EMPTY:   //Only compute speed if block previously empty
+          // bus.println ("S1=EMPTY");
+          if (curSensorState[m] != prevSensorState[m]) {
+            trainSpeed[k] = 0;              //reset
+            startSpeedTime[k] = millis();
+            return (CLKWISE);
+          }
+          if (curSensorState[n] != prevSensorState[n]) {
+            trainSpeed[k] = 0;              //reset
+            startSpeedTime[k] = millis();
+            return (CNTRCLKWISE);
+          }
+          return (ERR);
+        case CLKWISE:
+          if (curSensorState[n])            {         //xAxx
+            //Tripped opposing sensor, compute speed
+            trainSpeed[k] = blockLength[k] / (millis() - startSpeedTime[k]) * SMPHfactor;
+            startSpeedTime[k] = 0;                      //Reset
+            // bus.println ("S2-CLKWISE");
+            return (COMP);
+          }
+          else return (speedMeasStatus[k]);             //No change in state
+        case CNTRCLKWISE:
+          if (curSensorState[m])            {             //Axxx
+            //Tripped opposing sensor, compute speed
+            trainSpeed[k] = blockLength[k] / (millis() - startSpeedTime[k]) * SMPHfactor;
+            startSpeedTime[k] = 0;                                //Reset
+            // bus.println ("S3-CNTRCLKWISE");
+            return (COMP);
+          }
+          else return (speedMeasStatus[k]);           //No change in state
+        case COMP:
+          // bus.println ("S4-COMP");
+          return (EMPTY);
+        case ERR:
+          // bus.println ("S5-ERR");
+          return (ERR);
+        default:
+          return (ERR);
+      } //speedMeasStatus
+
+      return (ERR);                                   //No change in state
+    }  //Block occupied
+
+    else                 {                            //Block unoccupied
+      trainSpeed[k] = -1.0;
+      // bus.println ("S6-UNOCC");
+      return (EMPTY);
+    } //Block unoccpied
+
+    // bus.println ("S7-ERR");
+    return (ERR);                                     //Should never get here
+
+  } // Block occupancy
+
+  return (speedMeasStatus[k]);                        //No change
+} //BlockSpeedMeasure
+
+
+//***************** OLED DISPLAY SPEED ************************************************************
+void DisplaySpeedOLED (uint8_t sp)     {              //sp = speed
+
+  if (DISPLAY_PRESENT)               {
+    display.clearDisplay();
+    display.setTextSize(4);             // Draw 3X-scale text
+    display.setCursor(0, 0);            // Lower right
+    if (sp == 0) display.print("--"); // Replace with "--"
+    else         display.print(sp);
+    display.setTextSize(2);             // Normal 1:1 pixel scale
+    display.setCursor(72, 16);          // Lower middle
+    display.println("SMPH");
+    display.display();
+  }
+}
+
+
+//================ Process Light Type =======================================================
+bool ProcessLightType(int k, int m, int n)  {         //k=block, m=entry sensor, n=exit sensor)
+
+  //Light type: 1= red:green; 2= alt light; 3= alt lights+gate; 4=red:green+gate; 5= gate only; 6= r/g CW; 7= r/g CCW
+
+  bool xSigOn = false;             //Is signal on?
+  switch (lightType[k])  {
+    case 1:                        //Signal lights only
+      xSigOn = SignalLights(k, m, n);
+      break;
+    case 2:                        //Alternating crossing lights only
+      xSigOn = CrossingSignal(k, m, n);
+      break;
+    case 3:                        //Alternating crossing lights and gate
+      xSigOn = CrossingSignal(k, m, n);
+      curGateVal[k] = CrossingGate(k);
+      break;
+    case 4:                        //Signal lights and gate
+      xSigOn = SignalLights(k, m, n);
+      curGateVal[k] = CrossingGate(k);
+      break;
+    case 5:                        //Gate ONLY
+      curGateVal[k] = CrossingGate(k);
+      xSigOn = true;
+      break;
+    case 6:                        //Red-green only if going CW
+      if (curBlockDir[k] != CCW) xSigOn = SignalLights(k, m, n);
+      break;
+    case 7:                        //Red-green only if going CCW
+      if (curBlockDir[k] != CW) xSigOn = SignalLights(k, m, n);
+      break;
+    default:                       //Should never get here
+      break;
+  }
+
+  return (xSigOn);
+}
+
+
+//================= Turn on Signals (Simple, for now) ========================================
+bool SignalLights(int k, int m, int n) {                //k = block, m= Green, n= Red
+
+  //Simple on-off trackside lights for sensor activity;  no linkage of these lights to JMRI
+
+  if (curBlockOcc[k]) {
+    digitalWrite(lightPin[n], HIGH ^ lightLowActive[n]);  //Red
+    digitalWrite(lightPin[m], LOW ^ lightLowActive[m]);
+    delay(shortWait);                               //Wait a bit
+    return (true);
+  }
+  else  {
+    digitalWrite(lightPin[m], HIGH ^ lightLowActive[m]);  //Green
+    digitalWrite(lightPin[n], LOW ^ lightLowActive[n]);
+    delay(shortWait);                               //Wait a bit
+    return (false);
+  }
+}
+
+
+//================= Turn on/alternate Crossing Signals ========================================
+bool CrossingSignal(int k, int m, int n) {         //k=block number, m= first light, n= second light
+
+  //Simple flashing crossing signal when a block occupied;  no linkage of these lights to JMRI
+  if (curBlockOcc[k])  {
+    if (crossingSignalTime [k] < curTime)   {                //If time to alternate...
+      if (crossingSignalAlt[k])  {
+        crossingSignalAlt [k] = 0;
+        digitalWrite(lightPin[m], HIGH ^ lightLowActive[m]); //Alternate on-off left-right
+        digitalWrite(lightPin[n], LOW  ^ lightLowActive[n]);
+        crossingSignalTime [k] = curTime + crossingWait;              //Set time to wait to alternate
+      }
+      else  {
+        crossingSignalAlt [k] = 1;
+        digitalWrite(lightPin[n], HIGH ^ lightLowActive[n]); //Alternate on-off right-left
+        digitalWrite(lightPin[m], LOW  ^ lightLowActive[m]);
+        crossingSignalTime [k] = curTime + crossingWait;              //Set time to wait to alternate
+      }
+    }
+    return (true);                      //Signal is on
+  }
+
+  else   {                               //If block unoccupied, shut lights off
+    if (crossingSignalTime [k] < curTime)   {                //Wait till next alternation
+      crossingSignalAlt [k] = -1;
+      digitalWrite(lightPin[m], LOW ^ lightLowActive[m]);
+      digitalWrite(lightPin[n], LOW ^ lightLowActive[n]);
+      crossingSignalTime [k] = curTime;
+      return (false);                   //Signal now off
+    }
+    return (true);                      //Signal still on
+  }
+}
+
+
+//================= Lower/Raise Crossing Gate ========================================
+int CrossingGate(int k) {         //k=block number, m= entry sensor, n= exit sensor
+
+  if (gatePin[k] == 0)   {
+    bus.println("CG811 ERROR: zero pin number for gate");
+    return (999);
+  }
+
+  //Check that gate has finished prior move and then detach
+  if (servo0.isMoving(curGateVal[k]))   return (curGateVal[k]);
+  if (servo0.attached())   servo0.detach();
+
+
+  if (curBlockOcc[k] == prevBlockOcc[k])  return (curGateVal[k]);      //Only look at gate if occupancy has changed
+
+  bus.println("835: " + String(curGateVal[k]) + " ");
+  if (curBlockOcc[k])  {                             //See if block currently occupied
+    //Put gate down since block not previously occupied
+    servo0.attach(gatePin[k]);                      // attaches the servo to the servo object
+    delay(shortWait);
+    servo0.write(gateDown[k], servoSpeed, false);  // sets the servo position, doesn't wait for complete
+    delay(shortWait);                             // waits a bit
+    return (gateDown[k]);
+  }
+  else   {                                        //If block unoccupied, ...
+    //Put gate up if unoccupied
+    servo0.attach(gatePin[k]);                       // attaches the servo to the servo object
+    delay(shortWait);
+    servo0.write(gateUp[k], servoSpeed, false);  // sets the servo position, deosn't for complete
+    delay(shortWait);                             // waits a bit
+    return (gateUp[k]);
+  }
+  return (999);                     //Shouldn't get here
+
+}
+
+
+//====================== Manual gate operation via potentiometer ==========================================
+int ManualGate (int k)        {                    //k=block *** NOT YET WORKING 2020-02-05 ***
+
+  // ***  ONLY AVAILABLE FOR SERVO 0   ***
+
+  int gVal = analogRead(gatePotPin[k]);            // reads the value of the potentiometer (value between 0 and 1023)
+  gVal = map(gVal, 0, 1023, gateDown[k], gateUp[k]);  // scale it to use it with the servo (value from 0 and 180)
+  if (gVal <= (max(gateUp[k], gateDown[k]) - 5) || gVal >= (min(gateUp[k], gateDown[k]) + 5))   {
+    //Need to move gate
+    servo0.attach(gatePin[k]);                        // attaches the servo to the servo object
+    delay(shortWait);
+    // if (DEBUGD) bus.println(String(k) + " shortwait.  833MG");
+    servo0.write(gVal, servoSpeed, true);          // sets the servo position according to the scaled value
+    delay(shortWait);                                 // waits a bit before the next value is read and written
+    // if (DEBUGD) bus.println(String(k) + " shortwait.  838MG");
+    servo0.detach();
+    delay(shortWait);
+    // if (DEBUGD) bus.println(String(k) + " shortwait.  842MG");
+    return (gVal);
+  }
+  return (curGateVal[k]);                         //No change in gate value
+}
+
+
+//================= Reset block info =====================================================
+void BlockReset (int k, int m, int n)  {        //k=block m=entry sensor n=exit sensor
+
+  curBlockDir[k]       = UNK;
+  prevBlockDir[k]      = UNK;
+  curBlockOcc[k]          = false;
+  prevBlockOcc[k]      = true;            //Trick...
+  if (lightType[k] > 2 && lightType[k] < 6)  CrossingGate(k); //Raise crossing gate (expects BO to be different than previous)
+  prevBlockOcc[k]      = false;
+  curSensorState[m]    = sensorInactive;
+  curSensorState[n]    = sensorInactive;
+  prevSensorState[m]   = sensorInactive;
+  prevSensorState[n]   = sensorInactive;
+  comboSensorState[k]  = -1;
+  sensorChange[m]      = false;
+  sensorChange[n]      = false;
+  blockSensorChange[k] = false;
+  anySensorChange      = false;
+  speedMeasStatus[k]   = EMPTY;
+
+  //Reset JMRI bits
+  cmri.set_bit(0 + 8 * k, false);          //Block unoccupied
+  cmri.set_bit(1 + 8 * k, false);          //Sensors inactive
+  cmri.set_bit(2 + 8 * k, false);
+  cmri.set_bit(3 + 8 * k, false);          //Unknown direction
+  cmri.set_bit(4 + 8 * k, false);
+  cmri.set_bit(5 + 8 * k, false);          //No crossing sound
+
+  if (speedEligible[k]) cmri.set_byte(5, 0); //Reset speed measure bits
+}
+
+
+//================= Check JMRI Panel availability =========================================
+void CheckJMRI()  {
+
+  if (NOJMRI)   {
+    JMRIPanelAvail = true;
+    return;
+  }
+
+  if (cmri.get_bit(JMRI_ACTIVE_BIT)) {       //See if JMRI bit turned on
+    if (!JMRIPanelAvail)   {
+      cmri.set_bit(JMRI_ACTIVE_BIT, true);
+      JMRIPanelAvail = true;
+    }
+    return;
+  }
+  else {                                //Otherwise, JMRI bit turned off
+    if (JMRIPanelAvail)  {      //If previously turned on, reset to initial conditions
+      powerUp = true;
+    }
+    JMRIPanelAvail = false;
+    cmri.set_bit(JMRI_ACTIVE_BIT, false);
+    digitalWrite(LED_BUILTIN, HIGH);
+    delay(100);
+    digitalWrite(LED_BUILTIN, LOW);
+    delay(70);
+    loopCount = loopCount + 1;
+    //DEBUG
+    //if (loopCount % 10 == 0) bus.println("WaitforPanel: " + String(loopCount) + "  " + String(prevTOCState[0]) + String(curTOCState[0]) + " " + String(prevPBState[0]) + String(curPBState[0]));
+  }
+
+}
+
+//=============================================================================================
+
+
+//Sensor State Table and other discussion available from author
