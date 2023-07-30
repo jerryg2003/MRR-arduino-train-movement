@@ -1,5 +1,3 @@
-#include <MyVarSpeedServo.h>
-
 //Two sensors at ends of a block are checked to define a block and train direction
 //Crossing signal and gate can be triggered for each block; speed can be calculated for one block
 
@@ -24,31 +22,7 @@ const bool DEBUGT = true;   //Debug timing and delays  {FUTURE}
 //Code on Github may be modified or withdraw at any time
 //Copyright (c) 2021, 2020, 2019 Jerrold M. Grochow
 
-//Based on CMRI485Sens_Sig_v8 2020-01-07
-//v1a Bug fixes  2020-01-24
-//Forked to RRXingSpeed 2020-01-31
-//v1
-//v2  Correct bugs in BlockSpeedMeasure, change bits used for speed, block reset, activation 2020-03-14
-//v3  Longer wait for retesting sensors for false signal; shorter wait for sampling sensors again 2002-04-21
-//v4  Add data for second block (animation at train station) 2020-06-16
-//v4a Try to tighten up code to reduce timeouts at JMRI      2020-07-18
-//v4b Change time increments to get more even delays         2021-06-02
-//v5  Change pin numbers, prepare for use of displays        2021-07-06
-//v6  From v7-demo:                                          2021-07-08
-//     Add SSD1305 OLED display 2021-06-07
-//     Change reading for sensor transition to inactive to avoid false changes 2021-06-15
-//     Put OLED display in subroutine 2021-06-18
-//     Improve logic for analog sensor  2021=06=20
-//    Additional changes:                                    2021-07-09
-//     Fix speed reset byte number
-//     Add heartbeat bit
-//     Raise crossing gate on block reset
-//     Use bit 48 to indicate speed change (coordinate with Jython script)
-//v6a Change block 2 settings, add light type 5              2021-07-10
-//    Add blockIdleTime computation                          2021-07-10
-//v7  Change crossing signal time computation back           2021-07-11
-//v8  Signal lights as subr                                  2021-09-10
-//v8A change servo attach-detach logic                       2021-09-24
+//Version history at end of file
 
 //JMRI: set up C/MRI node as SMINI to handle up to 3 blocks; set up as SUSIC to handle more blocks (limited by size of arrays in arduino code)
 //JMRI: set up following Sensors and Lights to manage three blocks:
@@ -960,3 +934,30 @@ void CheckJMRI()  {
 
 
 //Sensor State Table and other discussion available from author
+
+//Based on CMRI485Sens_Sig_v8 2020-01-07
+//v1a Bug fixes  2020-01-24
+//Forked to RRXingSpeed 2020-01-31
+//v1
+//v2  Correct bugs in BlockSpeedMeasure, change bits used for speed, block reset, activation 2020-03-14
+//v3  Longer wait for retesting sensors for false signal; shorter wait for sampling sensors again 2002-04-21
+//v4  Add data for second block (animation at train station) 2020-06-16
+//v4a Try to tighten up code to reduce timeouts at JMRI      2020-07-18
+//v4b Change time increments to get more even delays         2021-06-02
+//v5  Change pin numbers, prepare for use of displays        2021-07-06
+//v6  From v7-demo:                                          2021-07-08
+//     Add SSD1305 OLED display 2021-06-07
+//     Change reading for sensor transition to inactive to avoid false changes 2021-06-15
+//     Put OLED display in subroutine 2021-06-18
+//     Improve logic for analog sensor  2021=06=20
+//    Additional changes:                                    2021-07-09
+//     Fix speed reset byte number
+//     Add heartbeat bit
+//     Raise crossing gate on block reset
+//     Use bit 48 to indicate speed change (coordinate with Jython script)
+//v6a Change block 2 settings, add light type 5              2021-07-10
+//    Add blockIdleTime computation                          2021-07-10
+//v7  Change crossing signal time computation back           2021-07-11
+//v8  Signal lights as subr                                  2021-09-10
+//v8A change servo attach-detach logic                       2021-09-24
+
